@@ -1,7 +1,7 @@
 /*  bam2bcf.c -- variant calling.
 
     Copyright (C) 2010-2012 Broad Institute.
-    Copyright (C) 2012-2014 Genome Research Ltd.
+    Copyright (C) 2012-2020 Genome Research Ltd.
 
     Author: Heng Li <lh3@sanger.ac.uk>
 
@@ -126,6 +126,7 @@ void bcf_callaux_clean(bcf_callaux_t *bca, bcf_call_t *call)
     if ( call->ADF ) memset(call->ADF,0,sizeof(int32_t)*(call->n+1)*B2B_MAX_ALLELES);
     if ( call->ADR ) memset(call->ADR,0,sizeof(int32_t)*(call->n+1)*B2B_MAX_ALLELES);
     if ( call->SCR ) memset(call->SCR,0,sizeof(*call->SCR)*(call->n+1));
+    if ( call->AQ ) memset(call->AQ,0,sizeof(*call->AQ)*call->n*B2B_MAX_ALLELES);
 }
 
 /*
@@ -213,6 +214,7 @@ int bcf_call_glfgen(int _n, const bam_pileup1_t *pl, int ref_base, bcf_callaux_t
                 else
                     r->ADF[b]++;
             }
+            if ( r->AQ ) r->AQ[b] += q;
         }
         ++r->anno[0<<2|is_diff<<1|bam_is_rev(p->b)];
         min_dist = p->b->core.l_qseq - 1 - p->qpos;
@@ -695,6 +697,21 @@ int bcf_call_combine(int n, const bcf_callret1_t *calls, bcf_callaux_t *bca, int
                 adf += B2B_MAX_ALLELES;
             }
         }
+        if ( call->AQ )
+        {
+            assert( call->n_alleles<=B2B_MAX_ALLELES );   // this is always true for SNPs and so far for indels as well
+
+            // reorder AQ to match the allele ordering at this site
+            int32_t tmp[B2B_MAX_ALLELES];
+            int32_t *aq = call->AQ, *aq_out = call->AQ;
+            for (i=0; i<n; i++)
+            {
+                for (j=0; j<call->n_alleles; j++) tmp[j] = aq[ call->a[j] ];
+                for (j=0; j<call->n_alleles; j++) aq_out[j] = tmp[j];
+                aq_out += call->n_alleles;
+                aq += B2B_MAX_ALLELES;
+            }
+        }
 
 //      if (ref_base < 0) fprintf(stderr, "%d,%d,%f,%d\n", call->n_alleles, x, sum_min, call->unseen);
         call->shift = (int)(sum_min + .499);
@@ -884,6 +901,8 @@ int bcf_call2bcf(bcf_call_t *bc, bcf1_t *rec, bcf_callret1_t *bcr, int fmt_flag,
     }
     if ( fmt_flag&B2B_FMT_SCR )
         bcf_update_format_int32(hdr, rec, "SCR", bc->SCR+1, rec->n_sample);
+    if ( fmt_flag&B2B_FMT_AQ )
+        bcf_update_format_int32(hdr, rec, "AQ", bc->AQ, rec->n_sample*rec->n_allele);
 
     return 0;
 }

@@ -1,6 +1,6 @@
 /* The MIT License
 
-   Copyright (c) 2018-2019 Genome Research Ltd.
+   Copyright (c) 2018-2020 Genome Research Ltd.
 
    Author: Petr Danecek <pd3@sanger.ac.uk>
    
@@ -46,9 +46,9 @@
 #define FLT_INCLUDE 1
 #define FLT_EXCLUDE 2
 
-#define iCHILD  0
-#define iFATHER 1
-#define iMOTHER 2
+#define iFATHER 0   // don't modify, AQ calculations depend on this order!
+#define iMOTHER 1
+#define iCHILD  2
 
 typedef struct
 {
@@ -68,12 +68,13 @@ typedef struct
     trio_t *trio;
     int has_fmt_ad;
     int ntrio, mtrio;
-    int32_t *pl, *ad, *dnm_qual, *vaf;    // input FMT/PL and AD values, output DNM and VAF
-    int mpl, mad;
+    int32_t *pl, *ad, *aq, *dnm_qual, *vaf;    // input FMT/PL, AD, AQ values, output DNM and VAF
+    int mpl, mad, maq;
     double min_score;
     double *aprob;  // proband's allele probabilities
     double *pl3;    // normalized PLs converted to probs for proband,father,mother
-    int maprob, mpl3, midx, *idx, force_ad;
+    double *aq2;    // AQs converted to probs
+    int maprob, mpl3, maq2, midx, *idx, force_ad, use_aq;
 }
 args_t;
 
@@ -95,6 +96,7 @@ static const char *usage_text(void)
         "       --force-AD                  calculate VAF even if the number of FMT/AD fields is incorrect. Use at your own risk!\n"
         "   -i, --include EXPR              include sites and samples for which the expression is true\n"
         "   -m, --min-score NUM             do not add FMT/DNM annotation if the score is smaller than NUM\n"
+        "       --no-AQ                     use FMT/PL instead of FMT/AQ at the cost of inflated FDR\n"
         "   -o, --output FILE               output file name [stdout]\n"
         "   -O, --output-type <b|u|z|v>     b: compressed BCF, u: uncompressed BCF, z: compressed VCF, v: uncompressed VCF [v]\n"
         "   -p, --pfm P,F,M                 sample names of proband, father, and mother\n"
@@ -113,6 +115,12 @@ static const char *usage_text(void)
         "\n"
         "   # Same as above plus extract a list of significant DNMs using the bcftools/query command\n"
         "   bcftools +trio-dnm -P file.ped file.bcf -Ou | bcftools query -i'DNM>10' -f'[%CHROM:%POS %SAMPLE %DNM\\n]'\n"
+        "\n"
+        "   # A complete example with the variant calling step. Note that this is one long\n"
+        "   # command and should be on a single line:\n"
+        "   bcftools mpileup -a AD,AQ -f ref.fa -Ou proband.bam father.bam mother.bam |\n"
+        "   bcftools call -mv -Ou |\n"
+        "   bcftools +trio-dnm -p proband,father,mother -Oz -o output.vcf.gz\n"
         "\n";
 }
 
@@ -187,6 +195,13 @@ static void init_data(args_t *args)
     int id;
     if ( (id=bcf_hdr_id2int(args->hdr, BCF_DT_ID, "PL"))<0 || !bcf_hdr_idinfo_exists(args->hdr,BCF_HL_FMT,id) )
         error("Error: the tag FORMAT/PL is not present in %s\n", args->fname);
+    if ( args->use_aq && ((id=bcf_hdr_id2int(args->hdr, BCF_DT_ID, "AQ"))<0 || !bcf_hdr_idinfo_exists(args->hdr,BCF_HL_FMT,id)) )
+        error(
+            "Error:\n"
+            "   The FORMAT/AQ tag is not present. If you want to proceed anyway, run with the --no-AQ\n"
+            "   option at the cost of inflated false discovery rate. The AQ annotation can be generated\n"
+            "   at the mpileup step together with the AD annotation using the command\n"
+            "       bcftools mpileup -a AD,AQ -f ref.fa file.bam\n");
     if ( (id=bcf_hdr_id2int(args->hdr, BCF_DT_ID, "AD"))<0 || !bcf_hdr_idinfo_exists(args->hdr,BCF_HL_FMT,id) )
         fprintf(stderr, "Warning: the tag FORMAT/AD is not present in %s, the output tag FORMAT/VAF will not be added\n", args->fname);
     else
@@ -238,10 +253,63 @@ static void destroy_data(args_t *args)
     free(args->trio);
     free(args->pl);
     free(args->ad);
+    free(args->aq);
+    free(args->aq2);
     if ( hts_close(args->out_fh)!=0 ) error("[%s] Error: close failed .. %s\n", __func__,args->output_fname);
     bcf_hdr_destroy(args->hdr_out);
     bcf_sr_destroy(args->sr);
     free(args);
+}
+static inline double subtract_num_phred(double a_num, double b_phred)
+{
+    return fabs(4.3429 * log(a_num - pow(10,-0.1*b_phred)));
+}
+static int32_t process_trio_aq(args_t *args, int nals, double *pl, int npl, double *aq[2], int naq1, int *al0, int *al1)
+{
+    assert( nals>1 );
+
+    // determine the two most likely proband's alleles
+    int i,j,k = 0,tmp;
+
+    hts_expand(int,nals,args->midx,args->idx);
+    hts_expand(double,nals,args->maprob,args->aprob);
+    for (i=0; i<nals; i++) args->aprob[i] = 0;
+    for (i=0; i<nals; i++)
+    {
+        for (j=0; j<=i; j++)
+        {
+            args->aprob[i] += pl[k];
+            args->aprob[j] += pl[k];
+            k++;
+        }
+    }
+
+    // sort in descendent order
+    double *arr = args->aprob;
+    int *idx = args->idx;
+    for (i=0; i<nals; i++) idx[i] = i;
+    for (i=1; i<nals; i++)
+        for (j=i; j>0 && arr[idx[j]] > arr[idx[j-1]]; j--)
+            tmp = idx[j], idx[j] = idx[j-1], idx[j-1] = tmp;
+
+    if ( idx[0] < idx[1] ) { *al0 = idx[0]; *al1 = idx[1]; }
+    else { *al0 = idx[1]; *al1 = idx[0]; }
+
+    int i0  = idx[0];
+    int i1  = idx[1];
+    //int k00 = bcf_alleles2gt(idx[0],idx[0]);
+    int k01 = bcf_alleles2gt(idx[0],idx[1]);
+    //int k11 = bcf_alleles2gt(idx[1],idx[1]);
+
+    // DNM0 = P01 * F0 * (1-M1) * (1-F1) * M0
+    // DNM1 = P01 * (1-F0) * M1 * F1 * (1-M0)
+    double pl_child = fabs(4.3429 * log(pl[k01]));
+    double dn0 = pl_child + aq[iFATHER][i0] + subtract_num_phred(1,aq[iMOTHER][i1]) + subtract_num_phred(1,aq[iFATHER][i1]) + aq[iMOTHER][i0];
+    double dn1 = pl_child + subtract_num_phred(1,aq[iFATHER][i0]) + aq[iMOTHER][i1] + aq[iFATHER][i1] + subtract_num_phred(1,aq[iMOTHER][i0]);
+    double ret = dn0 < dn1 ? dn0 : dn1;
+    ret = ret==0 ? 255 : subtract_num_phred(1,ret);
+    if ( ret>255 ) ret = 255;
+    return round(ret);
 }
 static float process_trio(args_t *args, int nals, double *pl[3], int npl, int *al0, int *al1)
 {
@@ -290,7 +358,7 @@ static float process_trio(args_t *args, int nals, double *pl[3], int npl, int *a
 }
 static void process_record(args_t *args, bcf1_t *rec)
 {
-    if ( rec->n_allele==1 )
+    if ( rec->n_allele==1 || bcf_get_variant_types(rec)==VCF_REF )
     {
         if ( bcf_write(args->out_fh, args->hdr_out, rec)!=0 ) error("[%s] Error: cannot write to %s\n", __func__,args->output_fname);
         return;
@@ -321,20 +389,54 @@ static void process_record(args_t *args, bcf1_t *rec)
     if ( npl1!=rec->n_allele*(rec->n_allele+1)/2 )
         error("fixme: not a diploid site at %s:%"PRId64": %d alleles, %d PLs\n", bcf_seqname(args->hdr,rec),(int64_t) rec->pos+1,rec->n_allele,npl1);
     hts_expand(double,3*npl1,args->mpl3,args->pl3);
+
+    int naq1 = 0;
+    if ( args->use_aq )
+    {
+        nret = bcf_get_format_int32(args->hdr,rec,"AQ",&args->aq,&args->maq);
+        naq1 = nret<=0 ? 0 : nret/nsmpl;
+        hts_expand(double,2*naq1,args->maq2,args->aq2);
+    }
+
     int i, j, k, al0, al1, write_dnm = 0, ad_set = 0;
     for (i=0; i<nsmpl; i++) args->dnm_qual[i] = bcf_int32_missing;
     for (i=0; i<args->ntrio; i++)
     {
-        double *ppl[3];
-        for (j=0; j<3; j++)
+        int32_t score;
+        if ( !args->use_aq )     // use PLs
         {
-            int32_t *src = args->pl + npl1 * args->trio[i].idx[j];
-            double *dst = ppl[j] = args->pl3 + j*npl1;
-            double sum = 0;
-            for (k=0; k<npl1; k++) { dst[k] = pow(10,-0.1*src[k]); sum += dst[k]; }
-            for (k=0; k<npl1; k++) dst[k] /= sum;
+            double *ppl[3];
+            for (j=0; j<3; j++)
+            {
+                int32_t *src = args->pl + npl1 * args->trio[i].idx[j];
+                double *dst = ppl[j] = args->pl3 + j*npl1;
+                double sum = 0;
+                for (k=0; k<npl1; k++) { dst[k] = pow(10,-0.1*src[k]); sum += dst[k]; }
+                for (k=0; k<npl1; k++) dst[k] /= sum;
+            }
+            score = process_trio(args, rec->n_allele, ppl, npl1, &al0, &al1);
         }
-        int32_t score = process_trio(args, rec->n_allele, ppl, npl1, &al0, &al1);
+        else                // use AQs 
+        {
+            double *ppl;
+            {
+                int32_t *src = args->pl + npl1 * args->trio[i].idx[iCHILD];
+                ppl = args->pl3 + iCHILD*npl1;
+                double sum = 0;
+                for (k=0; k<npl1; k++) { ppl[k] = pow(10,-0.1*src[k]); sum += ppl[k]; }
+                for (k=0; k<npl1; k++) ppl[k] /= sum;
+            }
+
+            double *paq[2];
+            for (j=0; j<2; j++)
+            {
+                int32_t *src = args->aq + naq1 * args->trio[i].idx[j];
+                double *dst = paq[j] = args->aq2 + j*naq1;
+                for (k=0; k<naq1; k++) dst[k] = src[k];
+            }
+            score = process_trio_aq(args, rec->n_allele, ppl, npl1, paq, naq1, &al0, &al1);
+        }
+
         if ( score >= args->min_score )
         {
             write_dnm = 1;
@@ -374,8 +476,10 @@ int run(int argc, char **argv)
     args_t *args = (args_t*) calloc(1,sizeof(args_t));
     args->argc   = argc; args->argv = argv;
     args->output_fname = "-";
+    args->use_aq = 1;
     static struct option loptions[] =
     {
+        {"no-AQ",no_argument,0,2},
         {"force-AD",no_argument,0,1},
         {"min-score",required_argument,0,'m'},
         {"include",required_argument,0,'i'},
@@ -392,11 +496,12 @@ int run(int argc, char **argv)
     };
     int c;
     char *tmp;
-    while ((c = getopt_long(argc, argv, "p:P:o:O:s:i:e:r:R:t:T:m:",loptions,NULL)) >= 0)
+    while ((c = getopt_long(argc, argv, "p:P:o:O:s:i:e:r:R:t:T:m:a",loptions,NULL)) >= 0)
     {
         switch (c) 
         {
             case  1 : args->force_ad = 1; break;
+            case  2 : args->use_aq = 0; break;
             case 'e': args->filter_str = optarg; args->filter_logic |= FLT_EXCLUDE; break;
             case 'i': args->filter_str = optarg; args->filter_logic |= FLT_INCLUDE; break;
             case 't': args->targets = optarg; break;

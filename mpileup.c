@@ -1,6 +1,6 @@
 /*  mpileup.c -- mpileup subcommand. Previously bam_plcmd.c from samtools
 
-    Copyright (C) 2008-2018 Genome Research Ltd.
+    Copyright (C) 2008-2020 Genome Research Ltd.
     Portions copyright (C) 2009-2012 Broad Institute.
 
     Author: Heng Li <lh3@sanger.ac.uk>
@@ -576,6 +576,8 @@ static int mpileup(mplp_conf_t *conf)
         bcf_hdr_append(conf->bcf_hdr,"##FORMAT=<ID=ADF,Number=R,Type=Integer,Description=\"Allelic depths on the forward strand (high-quality bases)\">");
     if ( conf->fmt_flag&B2B_FMT_ADR )
         bcf_hdr_append(conf->bcf_hdr,"##FORMAT=<ID=ADR,Number=R,Type=Integer,Description=\"Allelic depths on the reverse strand (high-quality bases)\">");
+    if ( conf->fmt_flag&B2B_FMT_AQ )
+        bcf_hdr_append(conf->bcf_hdr,"##FORMAT=<ID=AQ,Number=R,Type=Integer,Description=\"Phred-score allele quality sum for +trio-dnm calling\">");
     if ( conf->fmt_flag&B2B_INFO_AD )
         bcf_hdr_append(conf->bcf_hdr,"##INFO=<ID=AD,Number=R,Type=Integer,Description=\"Total allelic depths (high-quality bases)\">");
     if ( conf->fmt_flag&B2B_INFO_ADF )
@@ -624,6 +626,12 @@ static int mpileup(mplp_conf_t *conf)
         }
         if ( conf->fmt_flag&(B2B_INFO_SCR|B2B_FMT_SCR) )
             conf->bc.SCR = (int32_t*) malloc((nsmpl+1)*sizeof(*conf->bc.SCR));
+        if ( conf->fmt_flag&(B2B_FMT_AQ) )
+        {
+            conf->bc.AQ  = (int32_t*) malloc(nsmpl*sizeof(*conf->bc.AQ)*B2B_MAX_ALLELES);
+            for (i=0; i<nsmpl; i++)
+                conf->bcr[i].AQ = conf->bc.AQ + i*B2B_MAX_ALLELES;
+        }
     }
 
     // init mpileup
@@ -690,6 +698,7 @@ static int mpileup(mplp_conf_t *conf)
         free(conf->bc.ADR);
         free(conf->bc.ADF);
         free(conf->bc.SCR);
+        free(conf->bc.AQ);
         free(conf->bc.fmt_arr);
         free(conf->bcr);
     }
@@ -793,6 +802,7 @@ int parse_format_flag(const char *str)
         else if ( !strcasecmp(tags[i],"ADF") || !strcasecmp(tags[i],"FORMAT/ADF") || !strcasecmp(tags[i],"FMT/ADF") ) flag |= B2B_FMT_ADF;
         else if ( !strcasecmp(tags[i],"ADR") || !strcasecmp(tags[i],"FORMAT/ADR") || !strcasecmp(tags[i],"FMT/ADR") ) flag |= B2B_FMT_ADR;
         else if ( !strcasecmp(tags[i],"SCR") || !strcasecmp(tags[i],"FORMAT/SCR") || !strcasecmp(tags[i],"FMT/SCR") ) flag |= B2B_FMT_SCR;
+        else if ( !strcasecmp(tags[i],"AQ") || !strcasecmp(tags[i],"FORMAT/AQ") || !strcasecmp(tags[i],"FMT/AQ") ) flag |= B2B_FMT_AQ;
         else if ( !strcasecmp(tags[i],"INFO/SCR") ) flag |= B2B_INFO_SCR;
         else if ( !strcasecmp(tags[i],"INFO/AD") ) flag |= B2B_INFO_AD;
         else if ( !strcasecmp(tags[i],"INFO/ADF") ) flag |= B2B_INFO_ADF;
@@ -820,6 +830,7 @@ static void list_annotations(FILE *fp)
 "  FORMAT/AD  .. Allelic depth (Number=R,Type=Integer)\n"
 "  FORMAT/ADF .. Allelic depths on the forward strand (Number=R,Type=Integer)\n"
 "  FORMAT/ADR .. Allelic depths on the reverse strand (Number=R,Type=Integer)\n"
+"  FORMAT/AQ  .. Allele phred-score quality, for use with +trio-dnm (Number=R,Type=Integer)\n"
 "  FORMAT/DP  .. Number of high-quality bases (Number=1,Type=Integer)\n"
 "  FORMAT/SP  .. Phred-scaled strand bias P-value (Number=1,Type=Integer)\n"
 "  FORMAT/SCR .. Number of soft-clipped reads (Number=1,Type=Integer)\n"
