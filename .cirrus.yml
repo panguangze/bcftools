@@ -21,7 +21,7 @@ timeout_in: 10m
 # clone with our own commands too.
 clone_template: &HTSLIB_CLONE
   htslib_clone_script: |
-    .ci_helpers/clone "git://github.com/${CIRRUS_REPO_OWNER}/htslib" "${HTSDIR}" "${CIRRUS_BRANCH}"
+    .ci_helpers/clone "https://github.com/${CIRRUS_REPO_OWNER}/htslib" "${HTSDIR}" "${CIRRUS_BRANCH}"
 
 
 #--------------------------------------------------
@@ -109,11 +109,11 @@ ubuntu_task:
   << : *TEST
 
 
-# CentOS
-centos_task:
-  name: centos-gcc
+# Rocky Linux
+rockylinux_task:
+  name: rockylinux-gcc
   container:
-    image: centos:latest
+    image: rockylinux:latest
     cpu: 2
     memory: 1G
 

@@ -1,19 +1,19 @@
 /* The MIT License
 
-   Copyright (c) 2021 Genome Research Ltd.
+   Copyright (c) 2021-2022 Genome Research Ltd.
 
    Author: Petr Danecek <pd3@sanger.ac.uk>
-   
+
    Permission is hereby granted, free of charge, to any person obtaining a copy
    of this software and associated documentation files (the "Software"), to deal
    in the Software without restriction, including without limitation the rights
    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
    copies of the Software, and to permit persons to whom the Software is
    furnished to do so, subject to the following conditions:
-   
+
    The above copyright notice and this permission notice shall be included in
    all copies or substantial portions of the Software.
-   
+
    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -117,7 +117,7 @@ void abuf_set(abuf_t *buf, abuf_opt_t key, void *value)
     if ( key==INFO_TAG )
     {
         buf->split.info_tag = *((char**)value);
-        bcf_hdr_printf(buf->out_hdr,"##INFO=<ID=%s,Number=1,Type=String,Description=\"Original variant. Format: CHR|POS|REF|ALT|USED_ALT_IDX\">",buf->split.info_tag); 
+        bcf_hdr_printf(buf->out_hdr,"##INFO=<ID=%s,Number=1,Type=String,Description=\"Original variant. Format: CHR|POS|REF|ALT|USED_ALT_IDX\">",buf->split.info_tag);
         return;
     }
     if ( key==STAR_ALLELE ) { buf->star_allele = *((int*)value); return; }
@@ -141,7 +141,7 @@ static void _atomize_allele(abuf_t *buf, bcf1_t *rec, int ial)
     while ( rlen>1 && alen>1 && ref[rlen-1]==alt[alen-1] ) rlen--, alen--;
     int Mlen = rlen > alen ? rlen : alen;
 
-    atom_t *atom = NULL; 
+    atom_t *atom = NULL;
     int i;
     for (i=0; i<Mlen; i++)
     {
@@ -295,13 +295,13 @@ static void _split_table_set_chrom_qual(abuf_t *buf)
         bcf_update_filter(buf->out_hdr, out, rec->d.flt, rec->d.n_flt);
     }
 }
+int copy_string_field(char *src, int isrc, int src_len, kstring_t *dst, int idst);
 static void _split_table_set_info(abuf_t *buf, bcf_info_t *info, merge_rule_t mode)
 {
     const char *tag = bcf_hdr_int2id(buf->hdr,BCF_DT_ID,info->key);
     int type = bcf_hdr_id2type(buf->hdr,BCF_HL_INFO,info->key);
     int len  = bcf_hdr_id2length(buf->hdr,BCF_HL_INFO,info->key);
     if ( len==BCF_VL_G ) return;                                                // todo: Number=G INFO tags
-    if ( type==BCF_HT_STR && len!=BCF_VL_FIXED && len!=BCF_VL_VAR ) return;     // todo: Number=A,R,G for strings
     if ( type==BCF_HT_LONG ) return;                                            // todo: 64bit integers
 
     bcf1_t *rec = buf->split.rec;
@@ -311,7 +311,10 @@ static void _split_table_set_info(abuf_t *buf, bcf_info_t *info, merge_rule_t mo
 
     // Check for incorrect number of values. Note this check does not consider all values missing
     // and will remove annotations that don't pass.
-    if ( (len==BCF_VL_A && nval != rec->n_allele - 1) || (len==BCF_VL_R && nval != rec->n_allele) ) return;
+    if ( type==BCF_HT_INT || type==BCF_HT_REAL )
+    {
+        if ( (len==BCF_VL_A && nval != rec->n_allele - 1) || (len==BCF_VL_R && nval != rec->n_allele) ) return;
+    }
 
     if ( buf->mtmp2 < buf->mtmp )
     {
@@ -320,9 +323,14 @@ static void _split_table_set_info(abuf_t *buf, bcf_info_t *info, merge_rule_t mo
         buf->mtmp2 = buf->mtmp;
     }
 
+    const int num_size = 4;
+    assert( num_size==sizeof(int32_t) && num_size==sizeof(float) );
     int32_t missing = bcf_int32_missing;
     void *missing_ptr = (void*)&missing;
     if ( type==BCF_HT_REAL ) bcf_float_set_missing(*((float*)missing_ptr));
+    int32_t vector_end = bcf_int32_vector_end;
+    void *vector_end_ptr = (void*)&vector_end;
+    if ( type==BCF_HT_REAL ) bcf_float_set_vector_end(*((float*)vector_end_ptr));
 
     int iout,i;
     for (iout=0; iout<buf->split.nout; iout++)
@@ -332,22 +340,41 @@ static void _split_table_set_info(abuf_t *buf, bcf_info_t *info, merge_rule_t mo
         int ret = 0;
         if ( len==BCF_VL_FIXED || len==BCF_VL_VAR )
             ret = bcf_update_info(buf->out_hdr, out, tag, type==BCF_HT_FLAG ? NULL : buf->tmp, nval, type);
-        else if ( len==BCF_VL_A )
+        else if ( len==BCF_VL_A && type!=BCF_HT_STR )
         {
             int iori = buf->split.atoms[iout]->ial - 1;
             assert( iori<nval );
-            memcpy(buf->tmp2,buf->tmp+4*iori,4);
+            if ( !memcmp(vector_end_ptr,buf->tmp+num_size*iori,num_size) )
+                memcpy(buf->tmp2,missing_ptr,num_size);
+            else
+                memcpy(buf->tmp2,buf->tmp+num_size*iori,num_size);
             if ( star_allele )
-                memcpy(buf->tmp2+4,missing_ptr,4);
+                memcpy(buf->tmp2+num_size,missing_ptr,num_size);
             ret = bcf_update_info(buf->out_hdr, out, tag, buf->tmp2, 1 + star_allele, type);
         }
-        else if ( len==BCF_VL_R )
+        else if ( len==BCF_VL_A && type==BCF_HT_STR )
         {
-            memcpy(buf->tmp2,buf->tmp,4);   // REF contributes to all records
+            int iori = buf->split.atoms[iout]->ial - 1;
+            kstring_t dst;
+            dst.l = 0; dst.m = buf->mtmp2; dst.s = (char*)buf->tmp2;
+            kputc('.',&dst);
+            if ( star_allele ) kputs(",.",&dst);
+            copy_string_field(buf->tmp, iori, nval, &dst, 0);
+            if ( star_allele ) copy_string_field(".", 0, 1, &dst, 1);
+            buf->mtmp2 = dst.m;
+            buf->tmp2  = dst.s;
+            ret = bcf_update_info(buf->out_hdr, out, tag, buf->tmp2, dst.l, type);
+        }
+        else if ( len==BCF_VL_R && type!=BCF_HT_STR )
+        {
+            memcpy(buf->tmp2,buf->tmp,num_size);   // REF contributes to all records
             int iori = buf->split.atoms[iout]->ial;
             assert( iori<nval && iori<=buf->split.nori );
-            memcpy(buf->tmp2+4,buf->tmp+4*iori,4);
-            if ( type==BCF_HT_INT && mode==M_SUM ) 
+            if ( !memcmp(vector_end_ptr,buf->tmp+num_size*iori,num_size) )
+                memcpy(buf->tmp2+num_size,missing_ptr,num_size);
+            else
+                memcpy(buf->tmp2+num_size,buf->tmp+num_size*iori,num_size);
+            if ( type==BCF_HT_INT && mode==M_SUM )
             {
                 uint8_t *tbl = buf->split.tbl + iout*buf->split.nori;
                 for (i=iori; i<buf->split.nori; i++)
@@ -356,8 +383,22 @@ static void _split_table_set_info(abuf_t *buf, bcf_info_t *info, merge_rule_t mo
                 }
             }
             if ( star_allele )
-                memcpy(buf->tmp2+8,missing_ptr,4);
+                memcpy(buf->tmp2+2*num_size,missing_ptr,num_size);
             ret = bcf_update_info(buf->out_hdr, out, tag, buf->tmp2, 2 + star_allele, type);
+        }
+        else if ( len==BCF_VL_R && type==BCF_HT_STR )
+        {
+            int iori = buf->split.atoms[iout]->ial - 1;
+            kstring_t dst;
+            dst.l = 0; dst.m = buf->mtmp2; dst.s = (char*)buf->tmp2;
+            kputs(".,.",&dst);
+            if ( star_allele ) kputs(",.",&dst);
+            copy_string_field(buf->tmp, 0, nval, &dst, 0);
+            copy_string_field(buf->tmp, iori+1, nval, &dst, 1);
+            if ( star_allele ) copy_string_field(".", 0, 1, &dst, 2);
+            buf->mtmp2 = dst.m;
+            buf->tmp2  = dst.s;
+            ret = bcf_update_info(buf->out_hdr, out, tag, buf->tmp2, dst.l, type);
         }
         if ( ret!=0 ) error("An error occurred while updating INFO/%s\n",tag);
     }
@@ -425,7 +466,10 @@ static void _split_table_set_gt(abuf_t *buf)
                     error("Out-of-bounds genotypes at %s:%"PRIhts_pos"\n",bcf_seqname(buf->hdr,rec),rec->pos+1);
                 int ial = _split_table_get_ial(buf,iout,iori);
                 if ( ial==2 && !star_allele )
+                {
                     dst[j] = bcf_gt_missing;
+                    if ( bcf_gt_is_phased(src[j]) ) dst[j] |= 1;
+                }
                 else
                     dst[j] = bcf_gt_is_phased(src[j]) ? bcf_gt_phased(ial) : bcf_gt_unphased(ial);
             }
@@ -449,7 +493,7 @@ static void _split_table_set_format(abuf_t *buf, bcf_fmt_t *fmt, merge_rule_t mo
 
     int type = bcf_hdr_id2type(buf->hdr,BCF_HL_FMT,fmt->id);
     int len  = bcf_hdr_id2length(buf->hdr,BCF_HL_FMT,fmt->id);
-    if ( type==BCF_HT_STR && len!=BCF_VL_FIXED && len!=BCF_VL_VAR ) return;     // todo: Number=A,R,G for strings
+    if ( type==BCF_HT_STR && len==BCF_VL_G ) return;                            // possible todo: Number=G for strings
     if ( type==BCF_HT_LONG ) return;                                            // todo: 64bit integers
 
     const int num_size = 4;
@@ -457,23 +501,37 @@ static void _split_table_set_format(abuf_t *buf, bcf_fmt_t *fmt, merge_rule_t mo
     int32_t missing = bcf_int32_missing;
     void *missing_ptr = (void*)&missing;
     if ( type==BCF_HT_REAL ) bcf_float_set_missing(*((float*)missing_ptr));
+    int32_t vector_end = bcf_int32_vector_end;
+    void *vector_end_ptr = (void*)&vector_end;
+    if ( type==BCF_HT_REAL ) bcf_float_set_vector_end(*((float*)vector_end_ptr));
 
     bcf1_t *rec = buf->split.rec;
     int mtmp = ( type==BCF_HT_INT || type==BCF_HT_REAL ) ? buf->mtmp/num_size : buf->mtmp;  // number of items
     int nval = bcf_get_format_values(buf->hdr,rec,tag,&buf->tmp,&mtmp,type);
     if ( type==BCF_HT_INT || type==BCF_HT_REAL ) buf->mtmp = mtmp*num_size;                 // number of bytes
 
-    if ( len==BCF_VL_G && nval!=nsmpl*rec->n_allele && nval!=nsmpl*rec->n_allele*(rec->n_allele+1)/2 ) return;      // not haploid nor diploid
+    if ( type==BCF_HT_INT || type==BCF_HT_REAL )
+    {
+        if ( len==BCF_VL_G && nval!=nsmpl*rec->n_allele && nval!=nsmpl*rec->n_allele*(rec->n_allele+1)/2 ) return;      // not haploid nor diploid
 
-    // Check for incorrect number of values. Note this check does not consider all values missing
-    // and will remove annotations that don't pass.
-    if ( (len==BCF_VL_A && nval != nsmpl*(rec->n_allele - 1)) || (len==BCF_VL_R && nval != nsmpl*rec->n_allele) ) return;
+        // Check for incorrect number of values. Note this check does not consider all values missing
+        // and will remove annotations that don't pass.
+        if ( (len==BCF_VL_A && nval != nsmpl*(rec->n_allele - 1)) || (len==BCF_VL_R && nval != nsmpl*rec->n_allele) ) return;
+    }
 
     // Increase buffer size to accommodate star allele
     int nval1 = nval / nsmpl;
     mtmp = buf->mtmp;
-    if ( (len==BCF_VL_A || len==BCF_VL_R) && mtmp < num_size*nsmpl*(nval1+1) ) mtmp = num_size*nsmpl*(nval1+1); // +1 for the possibility of the star allele
-    else if ( len==BCF_VL_G && mtmp < num_size*nsmpl*(nval1+3) ) mtmp = num_size*nsmpl*(nval1+3);
+    if ( type==BCF_HT_INT || type==BCF_HT_REAL )
+    {
+        if ( (len==BCF_VL_A || len==BCF_VL_R) && mtmp < num_size*nsmpl*(nval1+1) ) mtmp = num_size*nsmpl*(nval1+1); // +1 for the possibility of the star allele
+        else if ( len==BCF_VL_G && mtmp < num_size*nsmpl*(nval1+3) ) mtmp = num_size*nsmpl*(nval1+3);
+    }
+    else if ( type==BCF_HT_STR )
+    {
+        if ( (len==BCF_VL_A || len==BCF_VL_R) && mtmp < nsmpl*(nval1+2) ) mtmp = nsmpl*(nval1+2); // +2 for the possibility of the star allele, ",."
+        else if ( len==BCF_VL_G && mtmp < nsmpl*(nval1+6) ) mtmp = nsmpl*(nval1+6);
+    }
 
     if ( buf->mtmp2 < mtmp )
     {
@@ -487,10 +545,10 @@ static void _split_table_set_format(abuf_t *buf, bcf_fmt_t *fmt, merge_rule_t mo
     {
         int star_allele = _has_star_allele(buf,iout);
         bcf1_t *out = buf->vcf[rbuf_kth(&buf->rbuf,iout)];
-        int ret = 0; 
+        int ret = 0;
         if ( len==BCF_VL_FIXED || len==BCF_VL_VAR )
             ret = bcf_update_format(buf->out_hdr, out, tag, buf->tmp, nval, type);
-        else if ( len==BCF_VL_A )
+        else if ( len==BCF_VL_A && type!=BCF_HT_STR )
         {
             int iori = buf->split.atoms[iout]->ial - 1;
             assert( iori<nval );
@@ -498,13 +556,38 @@ static void _split_table_set_format(abuf_t *buf, bcf_fmt_t *fmt, merge_rule_t mo
             {
                 void *src = buf->tmp  + nval1*num_size*i;
                 void *dst = buf->tmp2 + num_size*i*(star_allele+1);
-                memcpy(dst,src+iori*num_size,num_size);
+                if ( !memcmp(vector_end_ptr,src+iori*num_size,num_size) )
+                    memcpy(dst,missing_ptr,num_size);
+                else
+                    memcpy(dst,src+iori*num_size,num_size);
                 if ( star_allele )
                     memcpy(dst+num_size,missing_ptr,num_size);
             }
             ret = bcf_update_format(buf->out_hdr, out, tag, buf->tmp2, nsmpl*(star_allele+1), type);
         }
-        else if ( len==BCF_VL_R )
+        else if ( (len==BCF_VL_A || len==BCF_VL_R) && type==BCF_HT_STR )
+        {
+            int ioff = len==BCF_VL_R ? 1 : 0;
+            int iori = buf->split.atoms[iout]->ial - 1;
+            int nval1_dst = star_allele ? nval1 + 2 : nval1;
+            memset(buf->tmp2,0,nval1_dst*nsmpl);
+            for (i=0; i<nsmpl; i++)
+            {
+                kstring_t dst;
+                dst.l = 0; dst.m = nval1_dst; dst.s = (char*)buf->tmp2 + nval1_dst*i;
+                kputc_('.',&dst);
+                if ( star_allele ) kputsn_(",.",2,&dst);
+                if ( len==BCF_VL_R )
+                {
+                    kputsn_(",.",2,&dst);
+                    copy_string_field(buf->tmp+nval1*i, 0, nval1, &dst, 0);
+                }
+                copy_string_field(buf->tmp+nval1*i, iori+ioff, nval1, &dst, 0+ioff);
+                if ( star_allele ) copy_string_field(".", 0, 1, &dst, 1+ioff);
+            }
+            ret = bcf_update_format(buf->out_hdr, out, tag, buf->tmp2, nval1_dst*nsmpl, type);
+        }
+        else if ( len==BCF_VL_R && type!=BCF_HT_STR )
         {
             int iori = buf->split.atoms[iout]->ial;
             assert( iori<=nval );
@@ -514,7 +597,6 @@ static void _split_table_set_format(abuf_t *buf, bcf_fmt_t *fmt, merge_rule_t mo
                 void *dst = buf->tmp2 + num_size*i*(star_allele+2);
                 memcpy(dst,src,num_size);
                 memcpy(dst+num_size,src+iori*num_size,num_size);
-
                 if ( type==BCF_HT_INT && mode==M_SUM )
                 {
                     uint8_t *tbl = buf->split.tbl + iout*buf->split.nori;
@@ -526,7 +608,7 @@ static void _split_table_set_format(abuf_t *buf, bcf_fmt_t *fmt, merge_rule_t mo
             }
             ret = bcf_update_format(buf->out_hdr, out, tag, buf->tmp2, nsmpl*(star_allele+2), type);
         }
-        else if ( len==BCF_VL_G )
+        else if ( len==BCF_VL_G && type!=BCF_HT_STR )
         {
             int iori = buf->split.atoms[iout]->ial;
             int i01  = bcf_alleles2gt(0,iori);
@@ -628,7 +710,7 @@ void _abuf_split(abuf_t *buf, bcf1_t *rec)
         buf->vcf[j] = bcf_dup(rec);
         return;
     }
-    for (i=1; i<rec->n_allele; i++)
+    for (i=0; i<rec->n_allele; i++)
     {
         if ( _is_acgtn(rec->d.allele[i]) ) continue;
         rbuf_expand0(&buf->rbuf, bcf1_t*, buf->rbuf.n+1, buf->vcf);
@@ -690,6 +772,13 @@ void _abuf_split(abuf_t *buf, bcf1_t *rec)
         if ( !strcmp(tag,"QS") || !strcmp(tag,"AD") ) mode = M_SUM;
 
         _split_table_set_format(buf, &rec->d.fmt[i], mode);
+    }
+
+    // Check that at least one FORMAT field was added, if not, the number of samples must be set manually
+    for (i=0; i<buf->split.nout; i++)
+    {
+        bcf1_t *out = buf->vcf[rbuf_kth(&buf->rbuf,i)];
+        if ( !out->n_sample ) out->n_sample = rec->n_sample;
     }
 }
 
