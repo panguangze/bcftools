@@ -351,6 +351,7 @@ static void group_smpl(mplp_pileup_t *m, bam_smpl_t *bsmpl, int n, int *n_plp, c
     {
         for (j = 0; j < n_plp[i]; ++j)  // iterate over all reads available at this position
         {
+            auto l = n_plp[i];
             const bam_pileup1_t *p = plp[i] + j;
             int id = PLP_SAMPLE_ID(p->cd.i);
             if (m->n_plp[id] == m->m_plp[id])
